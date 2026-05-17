@@ -1,0 +1,40 @@
+version: "3.8"
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "80:80"
+    networks:
+      - app-net
+
+  backend:
+    build: ./backend
+    ports:
+      - "3000:3000"
+    environment:
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASS=admin123
+    networks:
+      - app-net
+    volumes:
+      - backend-data:/app/data
+
+  db:
+    image: mysql:8
+    environment:
+      - MYSQL_ROOT_PASSWORD=admin123
+      - MYSQL_DATABASE=innovatech
+    ports:
+      - "3306:3306"
+    networks:
+      - app-net
+    volumes:
+      - db-data:/var/lib/mysql
+
+networks:
+  app-net:
+
+volumes:
+  backend-data:
+  db-data:
