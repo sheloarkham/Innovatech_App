@@ -1,8 +1,31 @@
+# Etapa 1: Instalación de dependencias
+FROM node:18-alpine AS dependencies
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Etapa 2: Build (para TypeScript o compilación)
 FROM node:18-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci
 COPY . .
+RUN npm run build || npm run compile || echo "No build script found"
+
+# Etapa 3: Producción (imagen final optimizada)
+FROM node:18-alpine
+WORKDIR /app
+
+# Copiar solo dependencias de producción
+COPY --from=dependencies /app/node_modules ./node_modules
+
+# Copiar código compilado o fuente
+COPY --from=build /app/dist ./dist 2>/dev/null || COPY --from=build /app/*.js ./
+COPY package*.json ./
+
+# Crear directorio para datos persistentes
+RUN mkdir -p /app/data && chown -R node:node /app
+
 USER node
 EXPOSE 3000
-CMD ["node", "server.js"]
+CMD ["node", "dist/server.js"]

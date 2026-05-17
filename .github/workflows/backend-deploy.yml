@@ -1,0 +1,203 @@
+name: Backend - CI/CD Pipeline
+
+# ============================================
+# Trigger: Se ejecuta al hacer push a la rama 'deploy'
+# ============================================
+on:
+  push:
+    branches:
+      - deploy
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-deploy.yml'
+  workflow_dispatch:  # Permite ejecución manual desde GitHub
+
+# ============================================
+# Variables de entorno globales
+# ============================================
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: innovatech-backend
+  IMAGE_TAG: ${{ github.sha }}
+  CONTAINER_NAME: innovatech-backend
+
+jobs:
+  # ==========================================
+  # JOB 1: Build y Push a Amazon ECR
+  # ==========================================
+  build-and-push:
+    name: Build Docker Image & Push to ECR
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    
+    steps:
+      # Paso 1: Checkout del código
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Paso 2: Configurar credenciales de AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # Paso 3: Login a Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      # Paso 4: Construir imagen Docker
+      - name: Build Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "🔨 Building Docker image..."
+          cd backend
+          docker build \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -f dockerfile .
+          
+          echo "✅ Image built successfully"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      
+      # Paso 5: Escanear vulnerabilidades (opcional pero recomendado)
+      - name: Scan image for vulnerabilities
+        continue-on-error: true
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image --severity HIGH,CRITICAL \
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+      
+      # Paso 6: Push de imagen a ECR
+      - name: Push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "📤 Pushing image to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "✅ Image pushed successfully"
+      
+      # Paso 7: Guardar metadatos de la imagen
+      - name: Save image metadata
+        run: |
+          echo "Image: ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "Tag: ${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: ${{ env.ECR_REPOSITORY }}" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================
+  # JOB 2: Deploy a EC2
+  # ==========================================
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    
+    steps:
+      # Paso 1: Checkout del código (para acceder a scripts)
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Paso 2: Configurar SSH
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+      
+      # Paso 3: Deploy a EC2 via SSH
+      - name: Deploy to EC2
+        env:
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          IMAGE_FULL: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+        run: |
+          echo "🚀 Deploying to EC2..."
+          
+          ssh -i ~/.ssh/deploy_key.pem -o StrictHostKeyChecking=no $EC2_USER@$EC2_HOST << 'EOF'
+            set -e
+            
+            echo "📥 Logging into ECR..."
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+            
+            echo "🛑 Stopping old container..."
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+            
+            echo "📥 Pulling new image..."
+            docker pull ${{ env.IMAGE_FULL }}
+            
+            echo "🚀 Starting new container..."
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e DB_HOST=${{ secrets.DB_HOST }} \
+              -e DB_USER=${{ secrets.DB_USER }} \
+              -e DB_PASS=${{ secrets.DB_PASS }} \
+              -e DB_NAME=${{ secrets.DB_NAME }} \
+              -e NODE_ENV=production \
+              -v backend-data:/app/data \
+              ${{ env.IMAGE_FULL }}
+            
+            echo "🧹 Cleaning up old images..."
+            docker image prune -af --filter "until=24h" || true
+            
+            echo "✅ Deployment completed successfully"
+            
+            # Health check
+            echo "🏥 Running health check..."
+            sleep 5
+            curl -f http://localhost:3000/health || exit 1
+            echo "✅ Health check passed"
+          EOF
+      
+      # Paso 4: Verificar deployment
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -f http://${{ secrets.EC2_HOST }}:3000/health
+          echo "✅ Backend is healthy and running"
+      
+      # Paso 5: Notificación de éxito
+      - name: Deployment summary
+        run: |
+          echo "## 🎉 Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: Backend" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ needs.build-and-push.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Host**: ${{ secrets.EC2_HOST }}:3000" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================
+  # JOB 3: Rollback (en caso de fallo)
+  # ==========================================
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy]
+    if: failure()
+    
+    steps:
+      - name: Rollback to previous version
+        run: |
+          echo "❌ Deployment failed. Initiating rollback..."
+          ssh -i ~/.ssh/deploy_key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            docker stop ${{ env.CONTAINER_NAME }} || true
+            docker rm ${{ env.CONTAINER_NAME }} || true
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+          EOF
+          echo "✅ Rollback completed"

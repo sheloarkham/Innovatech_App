@@ -1,40 +1,85 @@
 version: "3.8"
+
 services:
+  # ========== Frontend Service ==========
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: dockerfile
+    container_name: innovatech-frontend
     ports:
       - "80:80"
+    environment:
+      - VITE_API_URL=${API_URL:-http://localhost:3000}
+    depends_on:
+      - backend
     networks:
       - app-net
+    restart: unless-stopped
 
+  # ========== Backend Service ==========
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: dockerfile
+    container_name: innovatech-backend
     ports:
       - "3000:3000"
     environment:
-      - DB_HOST=db
-      - DB_USER=root
-      - DB_PASS=admin123
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=3000
+      - DB_HOST=${DB_HOST:-db}
+      - DB_USER=${DB_USER:-root}
+      - DB_PASS=${DB_PASS:-admin123}
+      - DB_NAME=${DB_NAME:-innovatech}
+    depends_on:
+      db:
+        condition: service_healthy
     networks:
       - app-net
     volumes:
+      # Named volume para persistencia de datos del backend (logs, uploads, etc)
       - backend-data:/app/data
+    restart: unless-stopped
 
+  # ========== Database Service ==========
   db:
-    image: mysql:8
+    image: mysql:8.0
+    container_name: innovatech-db
     environment:
-      - MYSQL_ROOT_PASSWORD=admin123
-      - MYSQL_DATABASE=innovatech
+      - MYSQL_ROOT_PASSWORD=${DB_PASS:-admin123}
+      - MYSQL_DATABASE=${DB_NAME:-innovatech}
+      - MYSQL_USER=${DB_USER:-appuser}
+      - MYSQL_PASSWORD=${DB_PASS:-admin123}
     ports:
       - "3306:3306"
     networks:
       - app-net
     volumes:
+      # Named volume para persistencia de datos de MySQL
       - db-data:/var/lib/mysql
+      # Bind mount para scripts de inicialización SQL
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
 
+# ========== Networks ==========
 networks:
   app-net:
+    driver: bridge
+    name: innovatech-network
 
+# ========== Volumes ==========
+# Named volumes gestionados por Docker
 volumes:
   backend-data:
+    name: innovatech-backend-data
+    driver: local
   db-data:
+    name: innovatech-db-data
+    driver: local
